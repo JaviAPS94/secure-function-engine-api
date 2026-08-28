@@ -1,16 +1,31 @@
 # Secure Function Engine API
 
-A NestJS API that provides secure function encryption and execution capabilities.
+Servicio NestJS que cifra, valida y evalúa las fórmulas matemáticas de diseño
+de Rymel. Guarda el activo intelectual del negocio: las expresiones se
+almacenan cifradas en `project-back` y solo este servicio puede resolverlas,
+de modo que `project-front` obtiene resultados sin ver nunca la fórmula.
 
-## Description
+## Variables de entorno
 
-This API allows you to:
+| Variable | Obligatoria | Descripción |
+|---|---|---|
+| `ENCRYPTION_KEY` | Sí | Clave AES de **exactamente 32 bytes**. Se verifica al arrancar: si falta o mide otra cosa, el proceso no arranca. **Las fórmulas ya cifradas dependen de ella**: cambiarla las vuelve ilegibles para siempre. |
+| `SFE_SERVICE_SECRET` | Sí en producción | Secreto compartido con `project-back` que protege `POST /function-engine/decrypt`. Mientras no esté configurada, el descifrado queda abierto y el servicio avisa en cada petición. |
+| `PORT` | No | Puerto de escucha. Por omisión 3000; en los despliegues actuales, 5000. |
 
-1. Encrypt/decrypt arbitrary data using AES encryption
-2. Encrypt JavaScript functions for secure storage
-3. Execute encrypted JavaScript functions with parameters in a sandboxed environment
+### Orden de despliegue
 
-## Installation
+`SFE_SERVICE_SECRET` tiene una ventana de transición deliberada: si no está
+configurada, el guard deja pasar. Es para que este servicio pueda desplegarse
+**antes** que la versión de `project-back` que envía el secreto. Si se
+exigiera desde el primer momento, el descifrado respondería 401 y ningún
+administrador podría editar una fórmula.
+
+La secuencia es: desplegar el SFE sin el secreto → desplegar `project-back`
+enviándolo → configurar `SFE_SERVICE_SECRET` aquí y reiniciar. A partir de ese
+punto la ventana está cerrada.
+
+## Instalación
 
 ```bash
 $ npm install
@@ -29,113 +44,89 @@ $ npm run start:dev
 $ npm run start:prod
 ```
 
-## API Endpoints
+## Endpoints
 
-### Encryption Module
+Todas las fórmulas tienen la forma `y = <expresión>`. El lado izquierdo debe
+ser literalmente `y`.
 
-#### 1. Encrypt Data
+### `POST /function-engine/validate`
 
-- **Endpoint**: `POST /encryption/encrypt`
-- **Body**:
-  ```json
-  {
-    "data": "The data to encrypt",
-    "key": "Optional custom encryption key"
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "encryptedData": "encrypted_string_here",
-    "key": "encryption_key_here"
-  }
-  ```
+Valida una expresión y declara los símbolos que usa. **No cifra, no almacena y
+no registra la expresión.** Alimenta el editor y el probador del administrador.
 
-#### 2. Decrypt Data
-
-- **Endpoint**: `POST /encryption/decrypt`
-- **Body**:
-  ```json
-  {
-    "encryptedData": "encrypted_string_here",
-    "key": "encryption_key_here"
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "decryptedData": "The original data"
-  }
-  ```
-
-### Function Engine Module
-
-#### 1. Encrypt Function
-
-- **Endpoint**: `POST /function-engine/encrypt`
-- **Body**:
-  ```json
-  {
-    "function": "function add(a, b) { return a + b; }",
-    "key": "Optional custom encryption key"
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "encryptedFunction": "encrypted_function_string_here",
-    "key": "encryption_key_here"
-  }
-  ```
-
-#### 2. Execute Encrypted Function
-
-- **Endpoint**: `POST /function-engine/execute`
-- **Body**:
-  ```json
-  {
-    "encryptedFunction": "encrypted_function_string_here",
-    "key": "encryption_key_here",
-    "parameters": [5, 3]
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "result": 8,
-    "executed": true
-  }
-  ```
-
-## Security Considerations
-
-- The API implements basic sandboxing for function execution, but for production use, consider using more robust sandboxing solutions
-- The encryption uses AES with secure key generation
-- Always store encryption keys securely
-- Validate all input functions before encryption to prevent malicious code execution
-
-## Example Usage
-
-### 1. Encrypt a Function
-
-```javascript
-const calculateArea = `function calculateArea(radius) {
-  return Math.PI * radius * radius;
-}`;
-
-// POST to /function-engine/encrypt with the function
-// Store the encryptedFunction and key for later use
+```json
+// petición
+{ "plainTextFunction": "y = x^2 + CONST_1" }
+// respuesta
+{ "valid": true, "symbols": ["x", "CONST_1"], "functions": [] }
 ```
 
-### 2. Execute the Encrypted Function
+Si no es válida: `{ "valid": false, "error": "..." }`.
 
-```javascript
-// POST to /function-engine/execute with:
-// - The encrypted function
-// - The encryption key
-// - Parameters: [5]
-// Result will be the area of a circle with radius 5 (approximately 78.54)
+### `POST /function-engine/encrypt`
+
+Valida y cifra. El vector de inicialización es aleatorio, así que dos cifrados
+de la misma fórmula dan textos distintos.
+
+```json
+{ "plainTextFunction": "y = x^2 + CONST_1" }
+// -> { "encrypted": "<iv-hex>:<ciphertext-hex>" }
 ```
+
+### `POST /function-engine/evaluate-function`
+
+Descifra y evalúa. Las constantes y las variables entran como símbolos del
+ámbito de evaluación; si un nombre está en ambos, gana la constante.
+
+```json
+{
+  "encryptedFunction": "<iv-hex>:<ciphertext-hex>",
+  "parameters": { "x": 3 },
+  "constants": { "CONST_1": 7 }
+}
+// -> { "result": 16 }
+```
+
+### `POST /function-engine/decrypt` — privilegiado
+
+Devuelve la expresión en texto plano para que un administrador pueda editarla.
+Es la única operación que expone el activo protegido.
+
+- Exige el encabezado `x-service-secret` con el valor de `SFE_SERVICE_SECRET`.
+  La comparación es en tiempo constante sobre resúmenes de largo fijo: un
+  acierto parcial no se distingue de un fallo total.
+- Admite `x-correlation-id` para poder seguir el acceso hasta el usuario que
+  lo originó en `project-back`.
+- Cada intento queda auditado, se atienda o se rechace. **La auditoría nunca
+  incluye la expresión, el texto cifrado ni la clave.**
+- Solo lo invoca `project-back`, y solo en nombre de un usuario ADMIN.
+  `project-front` no tiene ninguna ruta hasta aquí.
+
+```
+POST /function-engine/decrypt
+x-service-secret: <SFE_SERVICE_SECRET>
+{ "encryptedFunction": "<iv-hex>:<ciphertext-hex>" }
+// -> { "plainTextFunction": "y = x^2 + CONST_1" }
+```
+
+## Notas de seguridad
+
+- **Las constantes se sustituyen por símbolo, nunca por texto.** El servicio
+  las reemplazaba antes con `replace` sobre la expresión: con `CONST_1 = 4`,
+  la expresión `CONST_10 + CONST_1` se convertía en `40 + 4` y devolvía 44 en
+  vez de 13 — sin error, solo un número equivocado. Y una constante llamada
+  `c` convertía `cos(x)` en `2os(x)`. Ahora las constantes entran en el ámbito
+  de evaluación y mathjs resuelve cada nombre completo o no lo resuelve.
+- **Las funciones que se salen de la aritmética están prohibidas**
+  (`import`, `createUnit`, `evaluate`, `parse`, `compile`, ...). Sin esa
+  restricción, quien pudiera cifrar una expresión podría convertir el motor en
+  un intérprete de propósito general.
+- **Los errores de descifrado no detallan la criptografía.** Distinguir
+  "relleno inválido" de "IV de largo equivocado" solo le sirve a quien esté
+  probando textos cifrados ajenos.
+- **La clave se verifica al arrancar.** Un despliegue mal configurado no llega
+  a atender peticiones, en vez de fallar en la primera petición de cifrado con
+  un error que no dice qué está mal.
 
 ## License
 
