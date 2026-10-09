@@ -239,4 +239,153 @@ describe('FunctionEngineService', () => {
       );
     });
   });
+
+  describe('fórmulas que invocan a otras', () => {
+    const dependencia = (plain: string, variables: string[], constants = {}) => ({
+      encryptedFunction: service.encryptFunction(plain).encrypted,
+      variables,
+      constants,
+    });
+
+    it('evalúa una fórmula que invoca a otra', () => {
+      const { encrypted } = service.encryptFunction('y = QUADRATIC(x) * 2');
+      const dependencies = {
+        QUADRATIC: dependencia('y = x^2 + 2*x + 1', ['x']),
+      };
+
+      expect(
+        service.evaluateFunction(encrypted, { x: 3 }, {}, dependencies),
+      ).toEqual({ result: 32 });
+    });
+
+    it('resuelve una dependencia que a su vez depende de otra', () => {
+      const { encrypted } = service.encryptFunction('y = A(x) + 1');
+      const dependencies = {
+        A: dependencia('y = B(x) * 2', ['x']),
+        B: dependencia('y = C(x) + 3', ['x']),
+        C: dependencia('y = x * k', ['x'], { k: 10 }),
+      };
+
+      // C(2) = 20, B = 23, A = 46, y = 47
+      expect(
+        service.evaluateFunction(encrypted, { x: 2 }, {}, dependencies),
+      ).toEqual({ result: 47 });
+    });
+
+    it('asigna los argumentos a las variables en su orden declarado', () => {
+      const { encrypted } = service.encryptFunction('y = RESTA(10, 4)');
+      const dependencies = { RESTA: dependencia('y = a - b', ['a', 'b']) };
+
+      expect(
+        service.evaluateFunction(encrypted, {}, {}, dependencies),
+      ).toEqual({ result: 6 });
+    });
+
+    it('las constantes de una dependencia no se mezclan con las de quien la invoca', () => {
+      const { encrypted } = service.encryptFunction('y = F(x) + k');
+      const dependencies = { F: dependencia('y = x * k', ['x'], { k: 100 }) };
+
+      expect(
+        service.evaluateFunction(encrypted, { x: 1 }, { k: 1 }, dependencies),
+      ).toEqual({ result: 101 });
+    });
+
+    it('sin la dependencia, falla como hasta ahora nombrando la función', () => {
+      const { encrypted } = service.encryptFunction('y = QUADRATIC(x) * 2');
+
+      expect(() => service.evaluateFunction(encrypted, { x: 3 })).toThrow(
+        /QUADRATIC/,
+      );
+    });
+
+    it('rechaza un ciclo sin evaluar, mostrando la cadena', () => {
+      const { encrypted } = service.encryptFunction('y = A(x)');
+      const dependencies = {
+        A: dependencia('y = B(x)', ['x']),
+        B: dependencia('y = A(x)', ['x']),
+      };
+
+      expect(() =>
+        service.evaluateFunction(encrypted, { x: 1 }, {}, dependencies),
+      ).toThrow(/circular.*A → B → A/);
+    });
+
+    it('rechaza un anidamiento de más de 5 niveles', () => {
+      const { encrypted } = service.encryptFunction('y = F1(x)');
+      const dependencies: Record<string, ReturnType<typeof dependencia>> = {};
+      for (let level = 1; level <= 6; level++) {
+        dependencies[`F${level}`] = dependencia(
+          level === 6 ? 'y = x' : `y = F${level + 1}(x)`,
+          ['x'],
+        );
+      }
+
+      expect(() =>
+        service.evaluateFunction(encrypted, { x: 1 }, {}, dependencies),
+      ).toThrow(/más de 5 niveles/);
+    });
+
+    it('admite exactamente 5 niveles', () => {
+      const { encrypted } = service.encryptFunction('y = F1(x)');
+      const dependencies: Record<string, ReturnType<typeof dependencia>> = {};
+      for (let level = 1; level <= 5; level++) {
+        dependencies[`F${level}`] = dependencia(
+          level === 5 ? 'y = x + 1' : `y = F${level + 1}(x)`,
+          ['x'],
+        );
+      }
+
+      expect(
+        service.evaluateFunction(encrypted, { x: 1 }, {}, dependencies),
+      ).toEqual({ result: 2 });
+    });
+
+    it('una aridad equivocada nombra a la dependencia', () => {
+      const { encrypted } = service.encryptFunction('y = F(x, 2)');
+      const dependencies = { F: dependencia('y = x', ['x']) };
+
+      expect(() =>
+        service.evaluateFunction(encrypted, { x: 1 }, {}, dependencies),
+      ).toThrow(/F espera 1 argumento/);
+    });
+
+    it('sin dependencias el resultado es idéntico al de siempre', () => {
+      const { encrypted } = service.encryptFunction('y = x^3 + b');
+
+      expect(service.evaluateFunction(encrypted, { x: 2, b: 5 }, {}, {})).toEqual(
+        service.evaluateFunction(encrypted, { x: 2, b: 5 }),
+      );
+    });
+  });
+
+  describe('fórmulas invocadas', () => {
+    it('validar devuelve las fórmulas invocadas, sin las funciones de mathjs', () => {
+      const result = service.validateFunction(
+        'y = QUADRATIC(x) + sqrt(CUBIC(x))',
+      );
+
+      expect(result.formulas?.sort()).toEqual(['CUBIC', 'QUADRATIC']);
+      expect(result.formulaCalls).toEqual([
+        { name: 'QUADRATIC', argCount: 1 },
+        { name: 'CUBIC', argCount: 1 },
+      ]);
+      expect(result.functions).toContain('sqrt');
+      expect(result.symbols).toEqual(['x']);
+    });
+
+    it('sin invocaciones la lista está vacía', () => {
+      expect(service.validateFunction('y = x^2 + 1').formulas).toEqual([]);
+    });
+
+    it('de una expresión cifrada, sin devolver su texto', () => {
+      const { encrypted } = service.encryptFunction('y = QUADRATIC(x) * 2');
+      const result = service.invokedFormulas(encrypted);
+
+      expect(result).toEqual({
+        formulas: ['QUADRATIC'],
+        formulaCalls: [{ name: 'QUADRATIC', argCount: 1 }],
+      });
+      expect(JSON.stringify(result)).not.toContain('* 2');
+    });
+  });
 });

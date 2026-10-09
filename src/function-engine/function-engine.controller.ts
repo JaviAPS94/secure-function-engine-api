@@ -5,6 +5,7 @@ import { EncryptFunctionDto } from './dto/encrypt-function.dto';
 import { ExecuteFunctionDto } from './dto/execute-function.dto';
 import { DecryptFunctionDto } from './dto/decrypt-function.dto';
 import { ValidateFunctionDto } from './dto/validate-function.dto';
+import { InvokedFormulasDto } from './dto/invoked-formulas.dto';
 import {
   correlationIdOf,
   ServiceSecretGuard,
@@ -24,7 +25,18 @@ export class FunctionEngineController {
       executeFunctionDto.encryptedFunction,
       executeFunctionDto.parameters,
       executeFunctionDto.constants,
+      executeFunctionDto.dependencies,
     );
+  }
+
+  /**
+   * Qué fórmulas invoca una expresión cifrada. No devuelve su texto, pero sí
+   * algo de su estructura, así que exige el secreto servicio-a-servicio.
+   */
+  @Post('invoked-formulas')
+  @UseGuards(ServiceSecretGuard)
+  invokedFormulas(@Body() dto: InvokedFormulasDto) {
+    return this.functionEngineService.invokedFormulas(dto.encryptedFunction);
   }
 
   @Post('encrypt')

@@ -14,6 +14,7 @@
  * completo o no lo resuelve. El texto de la expresión no se toca nunca.
  */
 
+import * as math from 'mathjs';
 import { parse, type MathNode } from 'mathjs';
 
 /**
@@ -58,7 +59,19 @@ export interface ExpressionAnalysis {
   symbols: string[];
   /** Funciones matemáticas que invoca. */
   functions: string[];
+  /**
+   * Las que invoca y mathjs no conoce: son otras fórmulas de diseño, por su
+   * código. Es lo que project-back necesita para registrar dependencias sin
+   * leer el texto plano.
+   */
+  formulas: string[];
+  /** Cada invocación a otra fórmula con cuántos argumentos recibe, para comprobar la aridad. */
+  formulaCalls: { name: string; argCount: number }[];
 }
+
+/** Si mathjs resuelve el nombre por sí mismo como función. */
+export const isMathFunction = (name: string): boolean =>
+  typeof (math as unknown as Record<string, unknown>)[name] === 'function';
 
 export class ExpressionError extends Error {}
 
@@ -147,7 +160,63 @@ export const analyzeEquation = (equation: string): ExpressionAnalysis => {
     rightSide,
     symbols: [...symbols],
     functions: [...functions],
+    formulas: [...functions].filter((name) => !isMathFunction(name)),
+    formulaCalls: formulaCallsOf(node),
   };
+};
+
+const formulaCallsOf = (node: MathNode): { name: string; argCount: number }[] => {
+  const calls: { name: string; argCount: number }[] = [];
+  node.traverse((child) => {
+    if (child.type !== 'FunctionNode') return;
+    const call = child as unknown as { fn?: { name?: string }; args?: unknown[] };
+    const name = call.fn?.name;
+    if (name !== undefined && !isMathFunction(name)) {
+      calls.push({ name, argCount: call.args?.length ?? 0 });
+    }
+  });
+  return calls;
+};
+
+/** Fórmulas que invoca un lado derecho ya analizado. */
+export const invokedFormulas = (node: MathNode): string[] =>
+  [...collectFunctionNames(node)].filter((name) => !isMathFunction(name));
+
+/**
+ * Cuántos niveles de fórmulas anidadas admite una evaluación.
+ *
+ * No hay todavía ninguna composición real: el límite existe para que un error
+ * de diseño se note enseguida, no para restringir un uso que exista.
+ */
+export const MAX_NESTING_DEPTH = 5;
+
+/**
+ * Comprueba, antes de evaluar nada, que las invocaciones entre fórmulas no
+ * formen un ciclo ni superen la profundidad máxima.
+ *
+ * `edges` va de cada fórmula a las que invoca; `root` es la que se evalúa.
+ * Un ciclo que llegara hasta aquí colgaría la evaluación, y el motor no puede
+ * fiarse de que quien llama ya lo comprobó.
+ */
+export const checkInvocationGraph = (
+  root: string,
+  edges: ReadonlyMap<string, readonly string[]>,
+): void => {
+  const walk = (name: string, path: string[]): void => {
+    if (path.includes(name)) {
+      throw new ExpressionError(
+        `Referencia circular entre fórmulas: ${[...path, name].join(' → ')}`,
+      );
+    }
+    // La raíz es el nivel 0: la profundidad cuenta las fórmulas anidadas.
+    if (path.length > MAX_NESTING_DEPTH) {
+      throw new ExpressionError(
+        `Las fórmulas se anidan más de ${MAX_NESTING_DEPTH} niveles: ${[...path, name].join(' → ')}`,
+      );
+    }
+    for (const next of edges.get(name) ?? []) walk(next, [...path, name]);
+  };
+  walk(root, []);
 };
 
 /**
